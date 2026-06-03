@@ -1,0 +1,5 @@
+node_modules/
+dist/
+bin/cloudflared-*
+*.log
+.DS_Store
