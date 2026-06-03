@@ -39,7 +39,7 @@ func appLog(_ message: String) {
 // MARK: - Thread-Safe Print Queue with Per-Printer Sub-Queues
 class PrintQueue {
     
-    // MARK: - Per-Printer Sub-Queue (xử lý pipeline cho từng máy in)
+    // MARK: - Per-Printer Sub-Queue (pipeline processing for each printer)
     private class PrinterSubQueue {
         struct Job {
             let pdfBuffer: Data
@@ -108,12 +108,12 @@ class PrintQueue {
                     self.activeCount -= 1
                     
                     if proc.terminationStatus == 0 {
-                        appLog("✅ [PrintQueue - \(self.printerName)] Spooled thành công trong \(String(format: "%.3f", duration))s")
+                        appLog("✅ [PrintQueue - \(self.printerName)] Spooled successfully in \(String(format: "%.3f", duration))s")
                         job.completion(.success(()))
                     } else {
                         let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                         let errMsg = String(data: errData, encoding: .utf8) ?? "lp command failed"
-                        appLog("❌ [PrintQueue - \(self.printerName)] Lỗi sau \(String(format: "%.3f", duration))s: \(errMsg)")
+                        appLog("❌ [PrintQueue - \(self.printerName)] Error after \(String(format: "%.3f", duration))s: \(errMsg)")
                         job.completion(.failure(NSError(domain: "PrintQueue", code: Int(proc.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errMsg])))
                     }
                     
@@ -123,7 +123,7 @@ class PrintQueue {
             
             do {
                 try printProcess.run()
-                // Pipeline: thử xử lý job tiếp theo ngay lập tức (nếu chưa đạt maxConcurrent)
+                // Pipeline: try to process the next job immediately (if maxConcurrent is not reached)
                 processNextJob()
             } catch {
                 try? FileManager.default.removeItem(at: tempURL)
@@ -140,7 +140,7 @@ class PrintQueue {
         }
     }
     
-    // MARK: - Manager (router phân phối đến sub-queue của từng máy in)
+    // MARK: - Manager (router distributing to sub-queue of each printer)
     private let managerQueue = DispatchQueue(label: "com.prasenz.printqueue.manager", qos: .userInitiated)
     private var subQueues = [String: PrinterSubQueue]()
     
@@ -251,7 +251,7 @@ class TunnelManager {
             guard let finalBinaryURL = binaryURL else {
                 let err = "[TunnelManager] Critical Error: Cloudflare binary [\(archName)] not found."
                 appLog(err)
-                self.updateStatus(.error, errorMessage: "Không tìm thấy file thực thi cloudflared")
+                self.updateStatus(.error, errorMessage: "cloudflared executable file not found")
                 return
             }
             
@@ -287,11 +287,11 @@ class TunnelManager {
                         if self?.status != .connected {
                             let errMsg: String
                             if lower.contains("unauthorized") || lower.contains("token") || lower.contains("invalid") {
-                                errMsg = "Token không hợp lệ hoặc hết hạn"
+                                errMsg = "Invalid or expired Token"
                             } else if lower.contains("network") || lower.contains("dns") || lower.contains("dial tcp") {
-                                errMsg = "Lỗi kết nối mạng / DNS"
+                                errMsg = "Network / DNS connection error"
                             } else {
-                                errMsg = "Lỗi kết nối Cloudflare"
+                                errMsg = "Cloudflare connection error"
                             }
                             self?.updateStatus(.error, errorMessage: errMsg)
                         }
@@ -428,25 +428,25 @@ class CopyPasteSecureTextField: NSSecureTextField {
 class SettingsViewController: NSViewController {
     
     // UI Elements
-    private let titleLabel = NSTextField(labelWithString: "Cấu hình Prasenz Print")
+    private let titleLabel = NSTextField(labelWithString: "Prasenz Print Configuration")
     
     private let tokenLabel = NSTextField(labelWithString: "CLOUDFLARE TUNNEL TOKEN")
     private let tokenField = CopyPasteSecureTextField()
     
     // Cloudflare Tunnel Status Elements
-    private let tunnelStatusTitleLabel = NSTextField(labelWithString: "TRẠNG THÁI TUNNEL")
+    private let tunnelStatusTitleLabel = NSTextField(labelWithString: "TUNNEL STATUS")
     private let tunnelStatusDot = NSView()
-    private let tunnelStatusLabel = NSTextField(labelWithString: "Chưa kết nối")
+    private let tunnelStatusLabel = NSTextField(labelWithString: "Disconnected")
     private let tunnelStatusStack = NSStackView()
     
-    private let portLabel = NSTextField(labelWithString: "CỔNG KẾT NỐI (PORT)")
+    private let portLabel = NSTextField(labelWithString: "CONNECTION PORT")
     private let portField = CopyPasteTextField()
     
-    private let printerListLabel = NSTextField(labelWithString: "DANH SÁCH MÁY IN")
+    private let printerListLabel = NSTextField(labelWithString: "PRINTER LIST")
     private let printerScrollView = NSScrollView()
     private let printerListStack = FlippedStackView()
     
-    private let autostartCheckbox = NSButton(checkboxWithTitle: "Khởi động cùng macOS", target: nil, action: nil)
+    private let autostartCheckbox = NSButton(checkboxWithTitle: "Start with macOS", target: nil, action: nil)
     
     private let refreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
@@ -515,12 +515,12 @@ class SettingsViewController: NSViewController {
         }
         
         styleLabel(tokenLabel)
-        tokenField.placeholderString = "Dán mã Token bảo mật của Cloudflare"
+        tokenField.placeholderString = "Paste Cloudflare secure Token"
         tokenField.bezelStyle = .roundedBezel
         tokenField.heightAnchor.constraint(equalToConstant: 24).isActive = true
         
         styleLabel(portLabel)
-        portField.placeholderString = "Mặc định là 37588 nếu để trống"
+        portField.placeholderString = "Default is 37588 if left empty"
         portField.bezelStyle = .roundedBezel
         portField.heightAnchor.constraint(equalToConstant: 24).isActive = true
         
@@ -637,7 +637,7 @@ class SettingsViewController: NSViewController {
         statusLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
         
         // Logs Toggle Button & Scroll View Setup
-        toggleLogsButton.title = "Xem log hoạt động ▾"
+        toggleLogsButton.title = "Show Activity Log ▾"
         toggleLogsButton.bezelStyle = .recessed
         toggleLogsButton.showsBorderOnlyWhileMouseInside = true
         toggleLogsButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
@@ -706,7 +706,7 @@ class SettingsViewController: NSViewController {
             self.logTextView.scrollToEndOfDocument(nil)
         }
         
-        showStatus("Đã tải cấu hình hiện tại.", isError: false)
+        showStatus("Current configuration loaded.", isError: false)
     }
     
     private func populatePrinterList(_ printers: [String]) {
@@ -717,7 +717,7 @@ class SettingsViewController: NSViewController {
         }
         
         if printers.isEmpty {
-            let emptyLabel = NSTextField(labelWithString: "Không tìm thấy máy in nào.")
+            let emptyLabel = NSTextField(labelWithString: "No printers found.")
             emptyLabel.font = NSFont.systemFont(ofSize: 12)
             emptyLabel.textColor = .secondaryLabelColor
             emptyLabel.isEditable = false
@@ -768,7 +768,7 @@ class SettingsViewController: NSViewController {
         guard let printerName = sender.toolTip else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(printerName, forType: .string)
-        showStatus("Đã copy: \(printerName)", isError: false)
+        showStatus("Copied: \(printerName)", isError: false)
     }
     
     private func getSystemPrinters() -> [String] {
@@ -796,7 +796,7 @@ class SettingsViewController: NSViewController {
     
     @objc private func refreshButtonClicked() {
         loadSettingsAndPrinters()
-        showStatus("Đã làm mới danh sách máy in.", isError: false)
+        showStatus("Printer list refreshed.", isError: false)
     }
     
     @objc private func saveButtonClicked() {
@@ -811,7 +811,7 @@ class SettingsViewController: NSViewController {
         
         // Validate port
         guard let portNum = UInt16(portVal), portNum >= 1024 else {
-            showStatus("Lỗi: Cổng in ấn phải là số từ 1024 đến 65535.", isError: true)
+            showStatus("Error: Printing port must be a number from 1024 to 65535.", isError: true)
             return
         }
         
@@ -832,12 +832,12 @@ class SettingsViewController: NSViewController {
             appDelegate.tunnelManager.startTunnel(token: tunnelToken)
             
             if autostartSuccess {
-                showStatus("Đã lưu cấu hình & Khởi chạy thành công!", isError: false)
+                showStatus("Configuration saved & started successfully!", isError: false)
             } else {
-                showStatus("Đã lưu cấu hình nhưng lỗi autostart: \(autostartMessage)", isError: true)
+                showStatus("Configuration saved but autostart error: \(autostartMessage)", isError: true)
             }
         } else {
-            showStatus("Lỗi: Không thể lưu file settings.json", isError: true)
+            showStatus("Error: Cannot save settings.json file", isError: true)
         }
     }
     
@@ -859,7 +859,7 @@ class SettingsViewController: NSViewController {
         
         let targetHeight: CGFloat = isLogsVisible ? 550 : 380
         
-        toggleLogsButton.title = isLogsVisible ? "Ẩn log hoạt động ▴" : "Xem log hoạt động ▾"
+        toggleLogsButton.title = isLogsVisible ? "Hide Activity Log ▴" : "Show Activity Log ▾"
         logScrollView.isHidden = !isLogsVisible
         
         self.preferredContentSize = NSSize(width: 440, height: targetHeight)
@@ -881,19 +881,19 @@ class SettingsViewController: NSViewController {
         switch status {
         case .disconnected:
             dotColor = .systemGray
-            statusText = "Chưa kết nối"
+            statusText = "Disconnected"
             textColor = .secondaryLabelColor
         case .connecting:
             dotColor = .systemOrange
-            statusText = "Đang kết nối..."
+            statusText = "Connecting..."
             textColor = .systemOrange
         case .connected:
             dotColor = .systemGreen
-            statusText = "Đã kết nối thành công"
+            statusText = "Connected successfully"
             textColor = .systemGreen
         case .error:
             dotColor = .systemRed
-            statusText = errorMessage ?? "Lỗi kết nối"
+            statusText = errorMessage ?? "Connection error"
             textColor = .systemRed
         }
         
@@ -960,7 +960,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             NSLog("[HTTP] Server successfully started on port \(port)")
         } catch {
             NSLog("CRITICAL: Failed to start HTTP server on port \(port): \(error.localizedDescription)")
-            showAlert(title: "Lỗi khởi động máy chủ", message: "Không thể lắng nghe cổng \(port): \(error.localizedDescription)")
+            showAlert(title: "Server Startup Error", message: "Cannot listen on port \(port): \(error.localizedDescription)")
         }
     }
     
@@ -1159,21 +1159,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 
                 try plistContent.write(to: plistURL, atomically: true, encoding: .utf8)
                 _ = shell("launchctl load \"\(plistURL.path)\"")
-                return (true, "Đã kích hoạt Khởi động cùng macOS!")
+                return (true, "Start with macOS enabled!")
             } catch {
-                return (false, "Lỗi: \(error.localizedDescription)")
+                return (false, "Error: \(error.localizedDescription)")
             }
         } else {
             do {
                 if fileManager.fileExists(atPath: plistURL.path) {
                     _ = shell("launchctl unload \"\(plistURL.path)\"")
                     try fileManager.removeItem(at: plistURL)
-                    return (true, "Đã hủy kích hoạt Khởi động cùng macOS!")
+                    return (true, "Start with macOS disabled!")
                 } else {
-                    return (true, "Không có dịch vụ nào đang chạy.")
+                    return (true, "No service running.")
                 }
             } catch {
-                return (false, "Lỗi: \(error.localizedDescription)")
+                return (false, "Error: \(error.localizedDescription)")
             }
         }
     }
@@ -1240,24 +1240,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             
             if request.body.isEmpty {
-                return HttpResponse(status: 400, statusText: "Bad Request", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Dữ liệu PDF truyền vào trống\"}".utf8))
+                return HttpResponse(status: 400, statusText: "Bad Request", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Input PDF data is empty\"}".utf8))
             }
             
             let printOptionsHeader = request.headers["x-print-options"] ?? "-o fit-to-page"
             let options = printOptionsHeader.split(separator: " ").map(String.init).filter { !$0.isEmpty }
             
-            appLog("📥 Nhận dữ liệu in cho máy [\(targetPrinter)] (\(Double(request.body.count) / 1024.0) KB) với options \(options). Đang đưa vào hàng đợi...")
+            appLog("📥 Received print data for printer [\(targetPrinter)] (\(Double(request.body.count) / 1024.0) KB) with options \(options). Enqueuing...")
             
             printQueue.enqueue(pdfBuffer: request.body, targetPrinter: targetPrinter, options: options) { result in
                 switch result {
                 case .success:
-                    appLog("✅ [PrintQueue] In thành công cho máy [\(targetPrinter)]")
+                    appLog("✅ [PrintQueue] Print successful for printer [\(targetPrinter)]")
                 case .failure(let error):
-                    appLog("❌ [PrintQueue] In thất bại cho máy [\(targetPrinter)]: \(error.localizedDescription)")
+                    appLog("❌ [PrintQueue] Print failed for printer [\(targetPrinter)]: \(error.localizedDescription)")
                 }
             }
             
-            return HttpResponse(status: 200, statusText: "OK", contentType: "application/json", headers: [:], body: Data("{\"success\":true,\"message\":\"Đã đưa vào hàng đợi in thành công\"}".utf8))
+            return HttpResponse(status: 200, statusText: "OK", contentType: "application/json", headers: [:], body: Data("{\"success\":true,\"message\":\"Successfully enqueued print job\"}".utf8))
             
         default:
             return HttpResponse(status: 404, statusText: "Not Found", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Not Found\"}".utf8))
@@ -1271,7 +1271,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             alert.messageText = title
             alert.informativeText = message
             alert.alertStyle = .warning
-            alert.addButton(withTitle: "Đồng ý")
+            alert.addButton(withTitle: "OK")
             alert.window.level = .floating
             alert.runModal()
         }

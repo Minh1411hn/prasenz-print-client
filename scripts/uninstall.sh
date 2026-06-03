@@ -8,7 +8,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}=====================================================${NC}"
-echo -e "${BLUE}  PrasenzPrinter - Gỡ cài đặt Menu Bar App${NC}"
+echo -e "${BLUE}  PrasenzPrinter - Uninstall Menu Bar App${NC}"
 echo -e "${BLUE}=====================================================${NC}"
 echo
 
@@ -16,41 +16,41 @@ LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.prasenz.printagent.plist"
 APP_PATH="/Applications/PrasenzPrinter.app"
 
 # Confirm
-echo -e "${YELLOW}⚠️  Bạn có chắc muốn gỡ cài đặt PrasenzPrinter hoàn toàn?${NC}"
-read -p "Nhập 'yes' để xác nhận: " confirm
+echo -e "${YELLOW}⚠️  Are you sure you want to completely uninstall PrasenzPrinter?${NC}"
+read -p "Type 'yes' to confirm: " confirm
 if [ "$confirm" != "yes" ]; then
-  echo -e "${BLUE}Đã hủy gỡ cài đặt.${NC}"
+  echo -e "${BLUE}Uninstallation cancelled.${NC}"
   exit 0
 fi
 echo
 
 # Step 1: Unload and clean LaunchAgent
-echo -e "${YELLOW}[1/3] Hủy đăng ký Khởi động cùng macOS...${NC}"
+echo -e "${YELLOW}[1/3] Unregistering Start with macOS...${NC}"
 if [ -f "$LAUNCH_AGENT" ]; then
   launchctl unload "$LAUNCH_AGENT" 2>/dev/null || true
   rm -f "$LAUNCH_AGENT"
-  echo -e "  ${GREEN}✅ Đã xóa LaunchAgent khỏi máy${NC}"
+  echo -e "  ${GREEN}✅ Removed LaunchAgent from system${NC}"
 else
-  echo -e "  ${GREEN}✅ LaunchAgent không được bật trên máy này${NC}"
+  echo -e "  ${GREEN}✅ LaunchAgent is not enabled on this system${NC}"
 fi
 echo
 
 # Step 2: Terminate running processes
-echo -e "${YELLOW}[2/3] Tắt tiến trình đang chạy ngầm...${NC}"
+echo -e "${YELLOW}[2/3] Stopping background processes...${NC}"
 pkill -f "PrasenzPrinter" 2>/dev/null || true
 pkill -f "prasenz-print-server" 2>/dev/null || true
 pkill -f "cloudflared-silicon" 2>/dev/null || true
 pkill -f "cloudflared-intel" 2>/dev/null || true
-echo -e "  ${GREEN}✅ Đã tắt các tiến trình liên quan${NC}"
+echo -e "  ${GREEN}✅ Stopped related processes${NC}"
 echo
 
 # Step 3: Remove from Applications
-echo -e "${YELLOW}[3/3] Xóa ứng dụng khỏi /Applications...${NC}"
+echo -e "${YELLOW}[3/3] Deleting application from /Applications...${NC}"
 if [ -d "$APP_PATH" ]; then
   rm -rf "$APP_PATH"
-  echo -e "  ${GREEN}✅ Đã xóa ${APP_PATH}${NC}"
+  echo -e "  ${GREEN}✅ Deleted ${APP_PATH}${NC}"
 else
-  echo -e "  ${GREEN}✅ Ứng dụng không tồn tại tại ${APP_PATH}${NC}"
+  echo -e "  ${GREEN}✅ Application does not exist at ${APP_PATH}${NC}"
 fi
 echo
 
@@ -58,7 +58,7 @@ echo
 rm -f /tmp/prasenz_print_agent.log /tmp/prasenz_print_agent_err.log 2>/dev/null || true
 
 echo -e "${BLUE}=====================================================${NC}"
-echo -e "${GREEN}🎉 ĐÃ GỠ CÀI ĐẶT HOÀN TOÀN!${NC}"
+echo -e "${GREEN}🎉 COMPLETELY UNINSTALLED!${NC}"
 echo -e "${BLUE}=====================================================${NC}"
-echo -e "  PrasenzPrinter đã được dọn dẹp sạch sẽ khỏi máy Mac của bạn."
+echo -e "  PrasenzPrinter has been cleanly removed from your Mac."
 echo
