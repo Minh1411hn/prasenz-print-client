@@ -36,98 +36,134 @@ func appLog(_ message: String) {
     LogManager.shared.log(message)
 }
 
-// MARK: - Thread-Safe, Serial Print Queue
+// MARK: - Thread-Safe Print Queue with Per-Printer Sub-Queues
 class PrintQueue {
-    struct Job {
-        let pdfBuffer: Data
-        let targetPrinter: String
-        let options: [String]
-        let completion: (Result<Void, Error>) -> Void
-    }
     
-    private let queue = DispatchQueue(label: "com.prasenz.printqueue", qos: .userInitiated)
-    private var isProcessing = false
-    private var jobs = [Job]()
-    
-    func enqueue(pdfBuffer: Data, targetPrinter: String, options: [String], completion: @escaping (Result<Void, Error>) -> Void) {
-        queue.async {
-            let job = Job(pdfBuffer: pdfBuffer, targetPrinter: targetPrinter, options: options, completion: completion)
-            self.jobs.append(job)
-            self.processNextJob()
-        }
-    }
-    
-    private func processNextJob() {
-        dispatchPrecondition(condition: .onQueue(queue))
-        
-        guard !isProcessing else { return }
-        guard !jobs.isEmpty else { return }
-        
-        isProcessing = true
-        let job = jobs.removeFirst()
-        
-        let tempFilename = "temp_job_\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString).pdf"
-        let tempDir = NSTemporaryDirectory()
-        let tempURL = URL(fileURLWithPath: tempDir).appendingPathComponent(tempFilename)
-        
-        do {
-            try job.pdfBuffer.write(to: tempURL)
-        } catch {
-            isProcessing = false
-            job.completion(.failure(error))
-            processNextJob()
-            return
+    // MARK: - Per-Printer Sub-Queue (xử lý pipeline cho từng máy in)
+    private class PrinterSubQueue {
+        struct Job {
+            let pdfBuffer: Data
+            let options: [String]
+            let completion: (Result<Void, Error>) -> Void
         }
         
-        let printProcess = Process()
-        printProcess.executableURL = URL(fileURLWithPath: "/usr/bin/lp")
+        let printerName: String
+        private let queue: DispatchQueue
+        private var jobs = [Job]()
+        private var activeCount = 0
+        private let maxConcurrent = 3
         
-        var arguments = ["-d", job.targetPrinter]
-        arguments.append(contentsOf: job.options)
-        arguments.append(tempURL.path)
+        init(printerName: String) {
+            self.printerName = printerName
+            self.queue = DispatchQueue(label: "com.prasenz.printqueue.\(printerName)", qos: .userInitiated)
+        }
         
-        printProcess.arguments = arguments
-        
-        let errPipe = Pipe()
-        printProcess.standardError = errPipe
-        
-        printProcess.terminationHandler = { [weak self] proc in
-            guard let self = self else { return }
-            try? FileManager.default.removeItem(at: tempURL)
-            
-            self.queue.async {
-                self.isProcessing = false
-                
-                if proc.terminationStatus == 0 {
-                    appLog("[PrintQueue] Printed successfully to \(job.targetPrinter)")
-                    job.completion(.success(()))
-                } else {
-                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-                    let errMsg = String(data: errData, encoding: .utf8) ?? "lp command failed"
-                    appLog("[PrintQueue] Failed printing to \(job.targetPrinter): \(errMsg)")
-                    job.completion(.failure(NSError(domain: "PrintQueue", code: Int(proc.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errMsg])))
-                }
-                
+        func enqueue(pdfBuffer: Data, options: [String], completion: @escaping (Result<Void, Error>) -> Void) {
+            queue.async {
+                self.jobs.append(Job(pdfBuffer: pdfBuffer, options: options, completion: completion))
                 self.processNextJob()
             }
         }
         
-        do {
-            try printProcess.run()
-        } catch {
-            try? FileManager.default.removeItem(at: tempURL)
-            isProcessing = false
-            job.completion(.failure(error))
-            processNextJob()
+        private func processNextJob() {
+            dispatchPrecondition(condition: .onQueue(queue))
+            
+            guard activeCount < maxConcurrent else { return }
+            guard !jobs.isEmpty else { return }
+            
+            activeCount += 1
+            let job = jobs.removeFirst()
+            
+            let tempFilename = "temp_job_\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString).pdf"
+            let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(tempFilename)
+            
+            do {
+                try job.pdfBuffer.write(to: tempURL)
+            } catch {
+                activeCount -= 1
+                job.completion(.failure(error))
+                processNextJob()
+                return
+            }
+            
+            let printProcess = Process()
+            printProcess.executableURL = URL(fileURLWithPath: "/usr/bin/lp")
+            
+            var arguments = ["-d", printerName]
+            arguments.append(contentsOf: job.options)
+            arguments.append(tempURL.path)
+            printProcess.arguments = arguments
+            
+            let errPipe = Pipe()
+            printProcess.standardError = errPipe
+            
+            let startTime = Date()
+            
+            printProcess.terminationHandler = { [weak self] proc in
+                guard let self = self else { return }
+                try? FileManager.default.removeItem(at: tempURL)
+                let duration = Date().timeIntervalSince(startTime)
+                
+                self.queue.async {
+                    self.activeCount -= 1
+                    
+                    if proc.terminationStatus == 0 {
+                        appLog("✅ [PrintQueue - \(self.printerName)] Spooled thành công trong \(String(format: "%.3f", duration))s")
+                        job.completion(.success(()))
+                    } else {
+                        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                        let errMsg = String(data: errData, encoding: .utf8) ?? "lp command failed"
+                        appLog("❌ [PrintQueue - \(self.printerName)] Lỗi sau \(String(format: "%.3f", duration))s: \(errMsg)")
+                        job.completion(.failure(NSError(domain: "PrintQueue", code: Int(proc.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errMsg])))
+                    }
+                    
+                    self.processNextJob()
+                }
+            }
+            
+            do {
+                try printProcess.run()
+                // Pipeline: thử xử lý job tiếp theo ngay lập tức (nếu chưa đạt maxConcurrent)
+                processNextJob()
+            } catch {
+                try? FileManager.default.removeItem(at: tempURL)
+                activeCount -= 1
+                job.completion(.failure(error))
+                processNextJob()
+            }
+        }
+        
+        var count: Int {
+            var c = 0
+            queue.sync { c = jobs.count }
+            return c
         }
     }
     
-    var count: Int {
-        var c = 0
-        queue.sync {
-            c = jobs.count
+    // MARK: - Manager (router phân phối đến sub-queue của từng máy in)
+    private let managerQueue = DispatchQueue(label: "com.prasenz.printqueue.manager", qos: .userInitiated)
+    private var subQueues = [String: PrinterSubQueue]()
+    
+    private func getOrCreateSubQueue(for printerName: String) -> PrinterSubQueue {
+        managerQueue.sync {
+            if let existing = subQueues[printerName] {
+                return existing
+            }
+            let newQueue = PrinterSubQueue(printerName: printerName)
+            subQueues[printerName] = newQueue
+            return newQueue
         }
-        return c
+    }
+    
+    func enqueue(pdfBuffer: Data, targetPrinter: String, options: [String], completion: @escaping (Result<Void, Error>) -> Void) {
+        let subQueue = getOrCreateSubQueue(for: targetPrinter)
+        subQueue.enqueue(pdfBuffer: pdfBuffer, options: options, completion: completion)
+    }
+    
+    var count: Int {
+        managerQueue.sync {
+            subQueues.values.reduce(0) { $0 + $1.count }
+        }
     }
 }
 
@@ -1212,26 +1248,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             
             appLog("📥 Nhận dữ liệu in cho máy [\(targetPrinter)] (\(Double(request.body.count) / 1024.0) KB) với options \(options). Đang đưa vào hàng đợi...")
             
-            let semaphore = DispatchSemaphore(value: 0)
-            var printResult: Result<Void, Error>?
-            
             printQueue.enqueue(pdfBuffer: request.body, targetPrinter: targetPrinter, options: options) { result in
-                printResult = result
-                semaphore.signal()
-            }
-            
-            _ = semaphore.wait(timeout: .now() + 30.0)
-            
-            if let result = printResult {
                 switch result {
                 case .success:
-                    return HttpResponse(status: 200, statusText: "OK", contentType: "application/json", headers: [:], body: Data("{\"success\":true,\"message\":\"Lệnh in đã được xử lý xong\"}".utf8))
+                    appLog("✅ [PrintQueue] In thành công cho máy [\(targetPrinter)]")
                 case .failure(let error):
-                    return HttpResponse(status: 500, statusText: "Internal Server Error", contentType: "application/json", headers: [:], body: Data("{\"error\":\"\(error.localizedDescription)\"}".utf8))
+                    appLog("❌ [PrintQueue] In thất bại cho máy [\(targetPrinter)]: \(error.localizedDescription)")
                 }
-            } else {
-                return HttpResponse(status: 500, statusText: "Internal Server Error", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Print job timeout\"}".utf8))
             }
+            
+            return HttpResponse(status: 200, statusText: "OK", contentType: "application/json", headers: [:], body: Data("{\"success\":true,\"message\":\"Đã đưa vào hàng đợi in thành công\"}".utf8))
             
         default:
             return HttpResponse(status: 404, statusText: "Not Found", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Not Found\"}".utf8))

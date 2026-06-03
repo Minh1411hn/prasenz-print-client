@@ -85,7 +85,6 @@ echo
 echo -e "${YELLOW}[4/5] Lắp ghép cấu trúc .app bundle hoàn chỉnh...${NC}"
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS/bin"
-mkdir -p "$APP_BUNDLE/Contents/MacOS/config"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy main Swift binary (the one and only app binary!)
@@ -103,8 +102,6 @@ if [ -f "$PROJECT_DIR/assets/AppIcon.icns" ]; then
   cp "$PROJECT_DIR/assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
 fi
 
-# Copy default config
-cp "$PROJECT_DIR/config/settings.json" "$APP_BUNDLE/Contents/MacOS/config/"
 
 # Set executable permissions
 chmod +x "$APP_BUNDLE/Contents/MacOS/PrasenzPrinter"
