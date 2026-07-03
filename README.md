@@ -31,10 +31,11 @@ A native macOS Menu Bar application that hosts an HTTP server to receive PDF doc
                                 [ macOS CUPS (lp) ]
 ```
 
-- **Network Framework (`NWListener`)**: Listens on TCP port `37588` (configurable) to accept print jobs.
-- **Thread-safe Print Queue**: Prints documents sequentially using a `DispatchQueue` to wrap `/usr/bin/lp` commands.
+- **Network Framework (`NWListener`)**: Listens on TCP port `37588` (configurable) to accept print jobs. Supports HTTP/1.1 keep-alive so a client can stream a burst of jobs over one connection, with a request body-size cap and an idle-connection timeout.
+- **Per-printer Print Queues**: Each printer gets its own serial sub-queue. Jobs to the **same** printer are submitted to CUPS strictly in the order they were received (FIFO), while **different** printers print in parallel. Documents are streamed to `/usr/bin/lp` via stdin (no temp files). A backlog cap protects memory under bursts (returns HTTP `503` when full).
 - **Subprocess Management**: Automatically runs and manages the appropriate `cloudflared` binary for the host system's architecture (Intel or Apple Silicon).
 - **Persistent Configuration**: Saved locally at `~/.prasenz-printer/settings.json`.
+- **Optional Log Forwarding**: When a New Relic license key is set, application logs are batched and shipped to the New Relic Log API.
 
 ---
 
@@ -75,6 +76,7 @@ The build script will:
 3. Use the Menu Bar icon **🖨️** to open the settings popover:
    - **Cloudflare Tunnel Token**: Enter your Cloudflare Zero Trust token.
    - **Connection Port**: Set the local port (default: `37588`).
+   - **New Relic License Key**: (Optional) Enter a New Relic ingest license key to forward logs.
    - **Printer List**: View available printers and copy target names for API usage.
    - **Start with macOS**: Configure the agent to launch at system startup.
 
@@ -104,6 +106,14 @@ Accepts binary PDF data and routes it to the target printer.
 - **Paper Size**: `-o media=A4` or `-o media=Letter` or `-o media=custom_80x200mm`
 - **Margins**: `-o page-left=0 -o page-right=0 -o page-top=0 -o page-bottom=0` (0 margins)
 - **Scaling**: `-o scaling=100` (no scale) or `-o fit-to-page`
+
+#### Responses
+- `200 OK` — job accepted and **enqueued** (returned immediately; the actual spool/print happens asynchronously, in received order per printer).
+- `400 Bad Request` — missing `x-printer-name` header or empty body.
+- `413 Payload Too Large` — body exceeds the server's max request size.
+- `503 Service Unavailable` — that printer's backlog is full; retry shortly.
+
+> **Ordering note:** order is guaranteed **per printer** only. To rely on it, send jobs for the same printer sequentially (or over a single keep-alive connection). Jobs to different printers run concurrently.
 
 ### Quick Testing with cURL
 
@@ -188,11 +198,25 @@ To completely remove the app and its background components:
 
 ---
 
+## 🔧 Configuration Keys (`~/.prasenz-printer/settings.json`)
+
+| Key | Description |
+|-----|-------------|
+| `TUNNEL_TOKEN` | Cloudflare Tunnel token. |
+| `PORT` | Local HTTP port (default `37588`). |
+| `NEW_RELIC_LICENSE_KEY` | New Relic ingest license key. Empty disables log forwarding. |
+| `NEW_RELIC_ENDPOINT` | Optional. Defaults to the US Log API (`https://log-api.newrelic.com/log/v1`); set the EU endpoint (`https://log-api.eu.newrelic.com/log/v1`) here if needed. |
+
+> The license key is a secret — restrict access to the file (e.g. `chmod 600 ~/.prasenz-printer/settings.json`).
+
+---
+
 ## 🔧 Troubleshooting
 
 ### Logs
 Since the app runs as a status bar application, logs are written to:
 - Standard logs: `tail -f /tmp/prasenz_print_agent.log`
 - Error logs: `tail -f /tmp/prasenz_print_agent_err.log`
+- New Relic: when `NEW_RELIC_LICENSE_KEY` is set, logs are also forwarded to the New Relic Logs UI (service `PrasenzPrinter`).
 
 ---

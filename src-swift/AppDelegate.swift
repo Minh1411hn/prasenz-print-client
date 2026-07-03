@@ -8,27 +8,116 @@ class LogManager {
     private let queue = DispatchQueue(label: "com.prasenz.logmanager")
     private(set) var logs = [String]()
     private let maxLogs = 200
-    
-    var onLogAdded: ((String) -> Void)?
-    
+
+    // MARK: New Relic log forwarding (optional; off until a license key is configured)
+    private var nrLicenseKey: String?
+    private var nrEndpoint = "https://log-api.newrelic.com/log/v1"
+    private var nrPending = [[String: Any]]()
+    private let nrMaxPending = 500          // bounded buffer — drops oldest beyond this
+    private let nrBatchSize = 100           // flush early once this many are pending
+    private var nrTimer: DispatchSourceTimer?
+    private let nrSession = URLSession(configuration: .ephemeral)
+    private let nrHostName = ProcessInfo.processInfo.hostName
+
     func log(_ message: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         let timestamp = formatter.string(from: Date())
         let logLine = "[\(timestamp)] \(message)"
-        
+
         NSLog("\(message)")
-        
+
         queue.async { [weak self] in
             guard let self = self else { return }
             self.logs.append(logLine)
             if self.logs.count > self.maxLogs {
                 self.logs.removeFirst()
             }
-            DispatchQueue.main.async {
-                self.onLogAdded?(logLine)
+            self.enqueueNewRelic(logLine)
+        }
+    }
+
+    /// Enables/updates New Relic forwarding, or disables it when `licenseKey` is empty.
+    func configureNewRelic(licenseKey: String, endpoint: String?) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let key = licenseKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.nrLicenseKey = key.isEmpty ? nil : key
+            if let ep = endpoint?.trimmingCharacters(in: .whitespacesAndNewlines), !ep.isEmpty {
+                self.nrEndpoint = ep
+            }
+            if self.nrLicenseKey != nil {
+                self.startNewRelicTimer()
+                NSLog("[NewRelic] log forwarding enabled -> \(self.nrEndpoint)")
+            } else {
+                self.nrTimer?.cancel()
+                self.nrTimer = nil
+                self.nrPending.removeAll()
             }
         }
+    }
+
+    // The methods below always run on `queue`.
+
+    private func enqueueNewRelic(_ message: String) {
+        guard nrLicenseKey != nil else { return }
+        nrPending.append([
+            "timestamp": Int(Date().timeIntervalSince1970 * 1000),
+            "message": message
+        ])
+        if nrPending.count > nrMaxPending {
+            nrPending.removeFirst(nrPending.count - nrMaxPending)
+        }
+        if nrPending.count >= nrBatchSize {
+            flushNewRelic()
+        }
+    }
+
+    private func startNewRelicTimer() {
+        guard nrTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in self?.flushNewRelic() }
+        timer.resume()
+        nrTimer = timer
+    }
+
+    private func flushNewRelic() {
+        guard let key = nrLicenseKey, !nrPending.isEmpty,
+              let url = URL(string: nrEndpoint) else { return }
+
+        let batch = nrPending
+        nrPending.removeAll(keepingCapacity: true)
+
+        let payload: [[String: Any]] = [[
+            "common": ["attributes": [
+                "service": "PrasenzPrinter",
+                "hostname": nrHostName,
+                "version": "1.2.0"
+            ]],
+            "logs": batch
+        ]]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload, options: []) else { return }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(key, forHTTPHeaderField: "Api-Key")
+        req.httpBody = body
+
+        nrSession.dataTask(with: req) { [weak self] _, response, error in
+            let ok = (response as? HTTPURLResponse).map { (200...299).contains($0.statusCode) } ?? false
+            guard !ok, let self = self else { return }
+            // Re-queue the failed batch (within cap) for the next flush. Use NSLog only —
+            // never appLog — so a forwarding failure can't feed itself back into the queue.
+            NSLog("[NewRelic] forward failed (\(error?.localizedDescription ?? "bad status")); re-queueing \(batch.count) logs")
+            self.queue.async {
+                self.nrPending.insert(contentsOf: batch, at: 0)
+                if self.nrPending.count > self.nrMaxPending {
+                    self.nrPending.removeFirst(self.nrPending.count - self.nrMaxPending)
+                }
+            }
+        }.resume()
     }
 }
 
@@ -38,75 +127,88 @@ func appLog(_ message: String) {
 
 // MARK: - Thread-Safe Print Queue with Per-Printer Sub-Queues
 class PrintQueue {
-    
-    // MARK: - Per-Printer Sub-Queue (pipeline processing for each printer)
+
+    /// Reject new jobs once a printer's backlog reaches this depth. Each queued job
+    /// holds its full PDF in memory, so this bounds RAM under a burst of requests.
+    static let maxQueueDepth = 100
+
+    // MARK: - Per-Printer Sub-Queue (strict FIFO submission for each printer)
     private class PrinterSubQueue {
         struct Job {
             let pdfBuffer: Data
             let options: [String]
+            let enqueuedAt: Date
             let completion: (Result<Void, Error>) -> Void
         }
-        
+
         let printerName: String
         private let queue: DispatchQueue
         private var jobs = [Job]()
         private var activeCount = 0
-        private let maxConcurrent = 3
-        
+        // Submit exactly one job at a time per printer so CUPS receives them in the
+        // order the requests arrived. A single printer prints serially anyway, so this
+        // guarantees ordering at no real throughput cost. Parallelism still happens
+        // ACROSS printers, since each printer has its own sub-queue.
+        private let maxConcurrent = 1
+        private var lastSpawnAt: Date?
+
         init(printerName: String) {
             self.printerName = printerName
             self.queue = DispatchQueue(label: "com.prasenz.printqueue.\(printerName)", qos: .userInitiated)
         }
-        
-        func enqueue(pdfBuffer: Data, options: [String], completion: @escaping (Result<Void, Error>) -> Void) {
-            queue.async {
-                self.jobs.append(Job(pdfBuffer: pdfBuffer, options: options, completion: completion))
-                self.processNextJob()
+
+        /// Enqueues a job. Returns false synchronously if this printer's backlog is full.
+        func enqueue(pdfBuffer: Data, options: [String], completion: @escaping (Result<Void, Error>) -> Void) -> Bool {
+            return queue.sync {
+                guard jobs.count < PrintQueue.maxQueueDepth else {
+                    return false
+                }
+                jobs.append(Job(pdfBuffer: pdfBuffer, options: options, enqueuedAt: Date(), completion: completion))
+                queue.async { self.processNextJob() }
+                return true
             }
         }
-        
+
         private func processNextJob() {
             dispatchPrecondition(condition: .onQueue(queue))
-            
+
             guard activeCount < maxConcurrent else { return }
             guard !jobs.isEmpty else { return }
-            
+
             activeCount += 1
             let job = jobs.removeFirst()
-            
-            let tempFilename = "temp_job_\(Int(Date().timeIntervalSince1970))_\(UUID().uuidString).pdf"
-            let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(tempFilename)
-            
-            do {
-                try job.pdfBuffer.write(to: tempURL)
-            } catch {
-                activeCount -= 1
-                job.completion(.failure(error))
-                processNextJob()
-                return
-            }
-            
+
             let printProcess = Process()
             printProcess.executableURL = URL(fileURLWithPath: "/usr/bin/lp")
-            
+
+            // No file argument => lp reads the document from stdin, avoiding a temp-file
+            // write + read + cleanup round-trip on every job.
             var arguments = ["-d", printerName]
             arguments.append(contentsOf: job.options)
-            arguments.append(tempURL.path)
             printProcess.arguments = arguments
-            
+
+            let inPipe = Pipe()
+            printProcess.standardInput = inPipe
             let errPipe = Pipe()
             printProcess.standardError = errPipe
-            
+
+            // Instrumentation: how long the job waited in queue, and the gap since the
+            // previous spawn for this printer. Lets us localize any "gap between prints".
+            let now = Date()
+            let waited = now.timeIntervalSince(job.enqueuedAt)
+            let sinceLast = lastSpawnAt.map { String(format: ", %.3fs since previous spawn", now.timeIntervalSince($0)) } ?? ""
+            lastSpawnAt = now
+            appLog("🖨️ [PrintQueue - \(printerName)] Spawning lp (waited \(String(format: "%.3f", waited))s in queue\(sinceLast)). Backlog: \(jobs.count)")
+
             let startTime = Date()
-            
+
             printProcess.terminationHandler = { [weak self] proc in
                 guard let self = self else { return }
-                try? FileManager.default.removeItem(at: tempURL)
                 let duration = Date().timeIntervalSince(startTime)
-                
+
                 self.queue.async {
                     self.activeCount -= 1
-                    
+
                     if proc.terminationStatus == 0 {
                         appLog("✅ [PrintQueue - \(self.printerName)] Spooled successfully in \(String(format: "%.3f", duration))s")
                         job.completion(.success(()))
@@ -116,34 +218,51 @@ class PrintQueue {
                         appLog("❌ [PrintQueue - \(self.printerName)] Error after \(String(format: "%.3f", duration))s: \(errMsg)")
                         job.completion(.failure(NSError(domain: "PrintQueue", code: Int(proc.terminationStatus), userInfo: [NSLocalizedDescriptionKey: errMsg])))
                     }
-                    
+
                     self.processNextJob()
                 }
             }
-            
+
             do {
                 try printProcess.run()
-                // Pipeline: try to process the next job immediately (if maxConcurrent is not reached)
-                processNextJob()
+                // Feed the PDF to lp's stdin off the serial queue so a full OS pipe buffer
+                // (large PDFs) can't block job submission. POSIX write returns -1 on a broken
+                // pipe (lp exited early) instead of raising; SIGPIPE is ignored at startup.
+                let writeHandle = inPipe.fileHandleForWriting
+                let writeFD = writeHandle.fileDescriptor
+                let data = job.pdfBuffer
+                DispatchQueue.global(qos: .userInitiated).async {
+                    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                        guard var ptr = raw.baseAddress, raw.count > 0 else { return }
+                        var remaining = raw.count
+                        while remaining > 0 {
+                            let n = write(writeFD, ptr, remaining)
+                            if n <= 0 { break }
+                            ptr = ptr.advanced(by: n)
+                            remaining -= n
+                        }
+                    }
+                    try? writeHandle.close()
+                }
             } catch {
-                try? FileManager.default.removeItem(at: tempURL)
+                try? inPipe.fileHandleForWriting.close()
                 activeCount -= 1
                 job.completion(.failure(error))
                 processNextJob()
             }
         }
-        
+
         var count: Int {
             var c = 0
             queue.sync { c = jobs.count }
             return c
         }
     }
-    
+
     // MARK: - Manager (router distributing to sub-queue of each printer)
     private let managerQueue = DispatchQueue(label: "com.prasenz.printqueue.manager", qos: .userInitiated)
     private var subQueues = [String: PrinterSubQueue]()
-    
+
     private func getOrCreateSubQueue(for printerName: String) -> PrinterSubQueue {
         managerQueue.sync {
             if let existing = subQueues[printerName] {
@@ -154,12 +273,14 @@ class PrintQueue {
             return newQueue
         }
     }
-    
-    func enqueue(pdfBuffer: Data, targetPrinter: String, options: [String], completion: @escaping (Result<Void, Error>) -> Void) {
+
+    /// Enqueues a job for the target printer. Returns false if that printer's backlog is full.
+    @discardableResult
+    func enqueue(pdfBuffer: Data, targetPrinter: String, options: [String], completion: @escaping (Result<Void, Error>) -> Void) -> Bool {
         let subQueue = getOrCreateSubQueue(for: targetPrinter)
-        subQueue.enqueue(pdfBuffer: pdfBuffer, options: options, completion: completion)
+        return subQueue.enqueue(pdfBuffer: pdfBuffer, options: options, completion: completion)
     }
-    
+
     var count: Int {
         managerQueue.sync {
             subQueues.values.reduce(0) { $0 + $1.count }
@@ -452,19 +573,17 @@ class SettingsViewController: NSViewController {
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     
     private let statusLabel = NSTextField(labelWithString: "")
-    
-    // Logs Elements
-    private let toggleLogsButton = NSButton()
-    private let logScrollView = NSScrollView()
-    private let logTextView = NSTextView()
-    private var isLogsVisible = false
-    
+
+    // New Relic log forwarding
+    private let nrKeyLabel = NSTextField(labelWithString: "NEW RELIC LICENSE KEY")
+    private let nrKeyField = CopyPasteSecureTextField()
+
     // Store reference to containerStack for full-width constraints
     private var containerStack: NSStackView!
-    
+
     override func loadView() {
-        self.view = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 380))
-        self.preferredContentSize = NSSize(width: 440, height: 380)
+        self.view = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 410))
+        self.preferredContentSize = NSSize(width: 440, height: 410)
     }
     
     override func viewDidLoad() {
@@ -523,7 +642,12 @@ class SettingsViewController: NSViewController {
         portField.placeholderString = "Default is 37588 if left empty"
         portField.bezelStyle = .roundedBezel
         portField.heightAnchor.constraint(equalToConstant: 24).isActive = true
-        
+
+        styleLabel(nrKeyLabel)
+        nrKeyField.placeholderString = "Optional — forward logs to New Relic"
+        nrKeyField.bezelStyle = .roundedBezel
+        nrKeyField.heightAnchor.constraint(equalToConstant: 24).isActive = true
+
         // Add settings fields to stack
         stack.addArrangedSubview(tokenLabel)
         stack.addArrangedSubview(tokenField)
@@ -558,7 +682,11 @@ class SettingsViewController: NSViewController {
         stack.addArrangedSubview(portLabel)
         stack.addArrangedSubview(portField)
         stack.setCustomSpacing(10, after: portField)
-        
+
+        stack.addArrangedSubview(nrKeyLabel)
+        stack.addArrangedSubview(nrKeyField)
+        stack.setCustomSpacing(10, after: nrKeyField)
+
         // Printer list section
         styleLabel(printerListLabel)
         stack.addArrangedSubview(printerListLabel)
@@ -588,7 +716,8 @@ class SettingsViewController: NSViewController {
         let fullWidthViews: [NSView] = [
             titleLabel, tokenLabel, tokenField,
             tunnelStatusTitleLabel, tunnelStatusStack,
-            portLabel, portField, printerListLabel, printerScrollView
+            portLabel, portField, nrKeyLabel, nrKeyField,
+            printerListLabel, printerScrollView
         ]
         for v in fullWidthViews {
             v.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
@@ -635,39 +764,6 @@ class SettingsViewController: NSViewController {
         stack.addArrangedSubview(statusLabel)
         statusLabel.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
         statusLabel.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
-        
-        // Logs Toggle Button & Scroll View Setup
-        toggleLogsButton.title = "Show Activity Log ▾"
-        toggleLogsButton.bezelStyle = .recessed
-        toggleLogsButton.showsBorderOnlyWhileMouseInside = true
-        toggleLogsButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        toggleLogsButton.target = self
-        toggleLogsButton.action = #selector(toggleLogsClicked)
-        stack.addArrangedSubview(toggleLogsButton)
-        stack.setCustomSpacing(6, after: toggleLogsButton)
-        
-        logScrollView.hasVerticalScroller = true
-        logScrollView.hasHorizontalScroller = false
-        logScrollView.autohidesScrollers = true
-        logScrollView.borderType = .bezelBorder
-        logScrollView.isHidden = true
-        
-        logTextView.isEditable = false
-        logTextView.isSelectable = true
-        logTextView.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        logTextView.backgroundColor = NSColor(red: 0.12, green: 0.12, blue: 0.14, alpha: 1.0)
-        logTextView.textColor = NSColor(red: 0.90, green: 0.90, blue: 0.92, alpha: 1.0)
-        logTextView.autoresizingMask = [.width, .height]
-        
-        logScrollView.documentView = logTextView
-        stack.addArrangedSubview(logScrollView)
-        
-        logScrollView.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
-        logScrollView.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
-        logScrollView.heightAnchor.constraint(equalToConstant: 160).isActive = true
-        
-        toggleLogsButton.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
-        toggleLogsButton.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
     }
     
     func loadSettingsAndPrinters() {
@@ -677,6 +773,7 @@ class SettingsViewController: NSViewController {
         let settings = appDelegate.readSettings()
         tokenField.stringValue = (settings["TUNNEL_TOKEN"] as? String) ?? ""
         portField.stringValue = (settings["PORT"] as? String) ?? "37588"
+        nrKeyField.stringValue = (settings["NEW_RELIC_LICENSE_KEY"] as? String) ?? ""
         
         // 2. Load autostart checkbox status
         let homeDir = FileManager.default.homeDirectoryForCurrentUser
@@ -694,16 +791,6 @@ class SettingsViewController: NSViewController {
         // 5. Register real-time update callback
         appDelegate.tunnelManager.onStatusChange = { [weak self] newStatus, errMsg in
             self?.updateTunnelStatusUI(status: newStatus, errorMessage: errMsg)
-        }
-        
-        // 6. Set up initial logs and listen for real-time streaming
-        logTextView.string = LogManager.shared.logs.joined(separator: "\n")
-        logTextView.scrollToEndOfDocument(nil)
-        
-        LogManager.shared.onLogAdded = { [weak self] _ in
-            guard let self = self else { return }
-            self.logTextView.string = LogManager.shared.logs.joined(separator: "\n")
-            self.logTextView.scrollToEndOfDocument(nil)
         }
         
         showStatus("Current configuration loaded.", isError: false)
@@ -803,24 +890,34 @@ class SettingsViewController: NSViewController {
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
         
         let tunnelToken = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        
+        let nrKey = nrKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
         var portVal = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if portVal.isEmpty {
             portVal = "37588"
         }
-        
+
         // Validate port
         guard let portNum = UInt16(portVal), portNum >= 1024 else {
             showStatus("Error: Printing port must be a number from 1024 to 65535.", isError: true)
             return
         }
-        
+
+        // Preserve advanced keys not exposed in the UI (e.g. a custom New Relic endpoint).
+        let existing = appDelegate.readSettings()
+        let nrEndpoint = (existing["NEW_RELIC_ENDPOINT"] as? String) ?? ""
+
         let newSettings: [String: Any] = [
             "TUNNEL_TOKEN": tunnelToken,
-            "PORT": String(portNum)
+            "PORT": String(portNum),
+            "NEW_RELIC_LICENSE_KEY": nrKey,
+            "NEW_RELIC_ENDPOINT": nrEndpoint
         ]
-        
+
         if appDelegate.writeSettings(newSettings) {
+            // Apply New Relic log forwarding immediately
+            LogManager.shared.configureNewRelic(licenseKey: nrKey, endpoint: nrEndpoint)
+
             // Apply autostart setting
             let autostartEnabled = autostartCheckbox.state == .on
             let (autostartSuccess, autostartMessage) = appDelegate.setAutostartEnabled(autostartEnabled)
@@ -851,25 +948,6 @@ class SettingsViewController: NSViewController {
             if self?.statusLabel.stringValue == currentString {
                 self?.statusLabel.stringValue = ""
             }
-        }
-    }
-    
-    @objc private func toggleLogsClicked() {
-        isLogsVisible.toggle()
-        
-        let targetHeight: CGFloat = isLogsVisible ? 550 : 380
-        
-        toggleLogsButton.title = isLogsVisible ? "Hide Activity Log ▴" : "Show Activity Log ▾"
-        logScrollView.isHidden = !isLogsVisible
-        
-        self.preferredContentSize = NSSize(width: 440, height: targetHeight)
-        if let appDelegate = NSApp.delegate as? AppDelegate {
-            appDelegate.popover.contentSize = NSSize(width: 440, height: targetHeight)
-        }
-        
-        if isLogsVisible {
-            logTextView.string = LogManager.shared.logs.joined(separator: "\n")
-            logTextView.scrollToEndOfDocument(nil)
         }
     }
     
@@ -920,7 +998,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let popover = NSPopover()
         let settingsVC = SettingsViewController()
         popover.contentViewController = settingsVC
-        popover.contentSize = NSSize(width: 440, height: 380)
+        popover.contentSize = NSSize(width: 440, height: 410)
         popover.behavior = .transient
         popover.delegate = self
         return popover
@@ -966,7 +1044,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     
     func applicationDidFinishLaunching(_ aNotification: Notification) {
         let settings = readSettings()
-        
+
+        // Forward logs to New Relic if a license key is configured (no-op otherwise)
+        LogManager.shared.configureNewRelic(
+            licenseKey: (settings["NEW_RELIC_LICENSE_KEY"] as? String) ?? "",
+            endpoint: settings["NEW_RELIC_ENDPOINT"] as? String
+        )
+
         // Start custom light HTTP Server dynamically on configured port
         let portVal = (settings["PORT"] as? String) ?? "37588"
         let portNum = UInt16(portVal) ?? 37588
@@ -1095,7 +1179,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         
         let defaultSettings: [String: Any] = [
             "TUNNEL_TOKEN": "",
-            "PORT": "37588"
+            "PORT": "37588",
+            "NEW_RELIC_LICENSE_KEY": "",
+            "NEW_RELIC_ENDPOINT": ""
         ]
         
         let dir = url.deletingLastPathComponent()
@@ -1247,8 +1333,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let options = printOptionsHeader.split(separator: " ").map(String.init).filter { !$0.isEmpty }
             
             appLog("📥 Received print data for printer [\(targetPrinter)] (\(Double(request.body.count) / 1024.0) KB) with options \(options). Enqueuing...")
-            
-            printQueue.enqueue(pdfBuffer: request.body, targetPrinter: targetPrinter, options: options) { result in
+
+            let accepted = printQueue.enqueue(pdfBuffer: request.body, targetPrinter: targetPrinter, options: options) { result in
                 switch result {
                 case .success:
                     appLog("✅ [PrintQueue] Print successful for printer [\(targetPrinter)]")
@@ -1256,7 +1342,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     appLog("❌ [PrintQueue] Print failed for printer [\(targetPrinter)]: \(error.localizedDescription)")
                 }
             }
-            
+
+            if !accepted {
+                appLog("⚠️ [PrintQueue] Backlog full for printer [\(targetPrinter)] (\(PrintQueue.maxQueueDepth) jobs). Rejecting with 503.")
+                return HttpResponse(status: 503, statusText: "Service Unavailable", contentType: "application/json", headers: [:], body: Data("{\"error\":\"Print queue is full, try again shortly\"}".utf8))
+            }
+
             return HttpResponse(status: 200, statusText: "OK", contentType: "application/json", headers: [:], body: Data("{\"success\":true,\"message\":\"Successfully enqueued print job\"}".utf8))
             
         default:
