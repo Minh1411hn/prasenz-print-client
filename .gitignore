@@ -3,3 +3,9 @@ dist/
 bin/cloudflared-*
 *.log
 .DS_Store
+src-windows/**/bin/
+src-windows/**/obj/
+src-windows/**/TestResults/
+bin/windows/
+dist/windows/
+dist/*.zip

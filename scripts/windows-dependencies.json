@@ -1,0 +1,15 @@
+{
+  "cloudflared": {
+    "version": "REQUIRES_VALIDATION",
+    "url": "",
+    "sha256": "",
+    "destination": "cloudflared.exe"
+  },
+  "sumatraPdf": {
+    "version": "REQUIRES_VALIDATION",
+    "url": "",
+    "sha256": "",
+    "destination": "SumatraPDF.exe"
+  },
+  "validationRequired": "Before a release, set each version, official direct download URL, and test it on Windows 10 22H2 x64. SHA256 is optional but must be copied from a verified vendor release/checksum, never guessed."
+}

@@ -1,0 +1,6 @@
+{
+  "method": "GET",
+  "path": "/health",
+  "expectedStatus": 200,
+  "requiredFields": ["status", "version", "arch", "uptime", "queueLength", "tunnelActive", "tunnelStatus", "tunnelErrorMessage"]
+}

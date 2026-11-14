@@ -1,0 +1,8 @@
+{
+  "method": "POST",
+  "path": "/print",
+  "headers": {},
+  "body": "%PDF-1.4",
+  "expectedStatus": 400,
+  "expectedJson": { "error": "Missing x-printer-name header" }
+}

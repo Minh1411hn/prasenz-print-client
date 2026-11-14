@@ -1,0 +1,7 @@
+{
+  "method": "POST",
+  "path": "/print",
+  "headers": { "x-printer-name": "Example Printer", "x-print-options": "-o fit-to-page", "p-req-id": "fixture-001" },
+  "expectedStatus": 200,
+  "expectedJson": { "success": true, "message": "Successfully enqueued print job" }
+}

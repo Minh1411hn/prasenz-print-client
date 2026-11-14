@@ -196,3 +196,7 @@ Since the app runs as a status bar application, logs are written to:
 - Error logs: `tail -f /tmp/prasenz_print_agent_err.log`
 
 ---
+
+## Windows
+
+A .NET 10 WinForms tray client is available under `src-windows/`. It has the same HTTP enqueue contract and targets `win-x64`; its setup, options compatibility limits, packaging prerequisite, logs, and uninstall notes are in [docs/windows.md](docs/windows.md). Windows dependency downloads are intentionally blocked until their release versions/URLs are validated and pinned in `scripts/windows-dependencies.json`.

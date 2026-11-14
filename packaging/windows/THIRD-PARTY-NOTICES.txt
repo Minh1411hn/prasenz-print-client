@@ -1,0 +1,3 @@
+PrasenzPrinter Windows distribution includes Microsoft .NET, cloudflared, and SumatraPDF.
+
+Before distributing an artifact, replace this notice with the license notices and source/source-access information required by the exact validated cloudflared and SumatraPDF releases in scripts/windows-dependencies.json. No third-party executable is committed to this repository.

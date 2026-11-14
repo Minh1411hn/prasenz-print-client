@@ -191,175 +191,396 @@ enum TunnelStatus: String {
 class TunnelManager {
     private var tunnelProcess: Process?
     private let queue = DispatchQueue(label: "com.prasenz.tunnelmanager")
-    
+
     // Status tracking
     private(set) var status: TunnelStatus = .disconnected
     private(set) var errorMessage: String? = nil
     var onStatusChange: ((TunnelStatus, String?) -> Void)?
-    
-    private func updateStatus(_ newStatus: TunnelStatus, errorMessage: String? = nil) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            if self.status != newStatus || self.errorMessage != errorMessage {
-                self.status = newStatus
-                self.errorMessage = errorMessage
-                DispatchQueue.main.async {
-                    self.onStatusChange?(newStatus, errorMessage)
-                }
+
+    // MARK: Self-healing state (all mutated only on `queue`)
+    // Sustained "network is unreachable" storms mean cloudflared bound its UDP
+    // sockets before the interface was ready (classic Login-Item-at-boot race);
+    // the sockets never self-heal, so we detect the burst and relaunch.
+    private var currentToken: String = ""
+    private var networkErrorEvents: [Date] = []     // sliding window of unreachable hits
+    private var isReconnecting = false               // single-flight guard for both triggers
+    private var processGeneration = 0                // stale-handler epoch
+    private var userInitiatedStop = false            // distinguishes deliberate vs unexpected exit
+    private var reconnectBackoff: TimeInterval = TunnelManager.initialBackoff
+    private var stableWorkItem: DispatchWorkItem?    // resets backoff after a stable connection
+
+    // Network reachability gating (best-effort; narrows the cold-boot race)
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSatisfied = false
+    private var didStartInitialTunnel = false
+    private var wakeObserver: NSObjectProtocol?   // reconnect on wake from sleep
+
+    private static let errorWindow: TimeInterval = 10.0   // count unreachable hits within this window
+    private static let errorThreshold = 6                 // ...before treating it as a sustained failure
+    private static let initialBackoff: TimeInterval = 3.0
+    private static let maxBackoff: TimeInterval = 30.0
+    private static let readyTimeout: TimeInterval = 8.0   // start anyway if network never reports ready
+    private static let terminateGrace: TimeInterval = 3.0 // SIGTERM grace before SIGKILL
+
+    // Assumes it is already running on `queue`.
+    private func setStatusLocked(_ newStatus: TunnelStatus, errorMessage: String? = nil) {
+        if self.status != newStatus || self.errorMessage != errorMessage {
+            self.status = newStatus
+            self.errorMessage = errorMessage
+            DispatchQueue.main.async {
+                self.onStatusChange?(newStatus, errorMessage)
             }
         }
     }
-    
+
+    // MARK: - Public entry points
+
+    /// Interactive/immediate start (Save button). Resets self-healing state.
     func startTunnel(token: String) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            
+            self.userInitiatedStop = false
             self.stopTunnelInternal()
-            
+            self.currentToken = token
+            self.reconnectBackoff = TunnelManager.initialBackoff
+            self.networkErrorEvents.removeAll()
+            self.isReconnecting = false
+            // This is an explicit start: the tunnel is now "active", and we assume
+            // the network is up (interactive Save). Seeding lastPathSatisfied = true
+            // prevents the monitor's first callback from being read as a drop→restore.
+            self.didStartInitialTunnel = true
+            self.lastPathSatisfied = true
+            self.beginMonitoring()
+            self.launchProcess()
+        }
+    }
+
+    /// Boot-time start: wait for a real network route before spawning cloudflared,
+    /// with a fallback timeout so we never get stuck if the path never reports ready.
+    func startTunnelWhenNetworkReady(token: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.currentToken = token
             guard !token.isEmpty else {
-                appLog("[TunnelManager] Cloudflare Tunnel Token is empty. Skipping tunnel start.")
-                self.updateStatus(.disconnected)
+                self.setStatusLocked(.disconnected)
                 return
             }
-            
-            self.updateStatus(.connecting)
-            
-            let archName: String
-            #if arch(arm64)
-            archName = "cloudflared-silicon"
-            #else
-            archName = "cloudflared-intel"
-            #endif
-            
-            let fileManager = FileManager.default
-            var binaryURL: URL?
-            
-            if let url = Bundle.main.url(forResource: archName, withExtension: nil, subdirectory: "bin") {
-                binaryURL = url
-            } else if let url = Bundle.main.url(forResource: archName, withExtension: nil) {
-                binaryURL = url
-            }
-            
-            if binaryURL == nil {
-                let path1 = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bin/\(archName)")
-                if fileManager.fileExists(atPath: path1.path) {
-                    binaryURL = path1
-                }
-            }
-            
-            if binaryURL == nil, let exeURL = Bundle.main.executableURL {
-                let path2 = exeURL.deletingLastPathComponent().appendingPathComponent("bin/\(archName)")
-                if fileManager.fileExists(atPath: path2.path) {
-                    binaryURL = path2
-                }
-            }
-            
-            if binaryURL == nil {
-                let path3 = URL(fileURLWithPath: fileManager.currentDirectoryPath).appendingPathComponent("bin/\(archName)")
-                if fileManager.fileExists(atPath: path3.path) {
-                    binaryURL = path3
-                }
-            }
-            
-            guard let finalBinaryURL = binaryURL else {
-                let err = "[TunnelManager] Critical Error: Cloudflare binary [\(archName)] not found."
-                appLog(err)
-                self.updateStatus(.error, errorMessage: "cloudflared executable file not found")
-                return
-            }
-            
-            appLog("[TunnelManager] Starting Cloudflare Tunnel using \(finalBinaryURL.path)...")
-            
-            let process = Process()
-            process.executableURL = finalBinaryURL
-            process.arguments = ["tunnel", "run", "--token", token]
-            
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            
-            outPipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                    appLog("[Cloudflared STDOUT] \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                }
-            }
-            
-            errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                if let output = String(data: data, encoding: .utf8), !output.isEmpty {
-                    let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                    appLog("[Cloudflared STDERR] \(trimmedOutput)")
-                    
-                    let lower = trimmedOutput.lowercased()
-                    if lower.contains("established") || lower.contains("registered") {
-                        self?.updateStatus(.connected)
-                    } else if lower.contains("failed") || lower.contains("error") || lower.contains("cannot") || lower.contains("unauthorized") {
-                        // Only change to error if not currently connected
-                        if self?.status != .connected {
-                            let errMsg: String
-                            if lower.contains("unauthorized") || lower.contains("token") || lower.contains("invalid") {
-                                errMsg = "Invalid or expired Token"
-                            } else if lower.contains("network") || lower.contains("dns") || lower.contains("dial tcp") {
-                                errMsg = "Network / DNS connection error"
-                            } else {
-                                errMsg = "Cloudflare connection error"
-                            }
-                            self?.updateStatus(.error, errorMessage: errMsg)
-                        }
-                    }
-                }
-            }
-            
-            process.terminationHandler = { [weak self] proc in
-                appLog("[TunnelManager] Cloudflare Tunnel exited with status: \(proc.terminationStatus)")
-                outPipe.fileHandleForReading.readabilityHandler = nil
-                errPipe.fileHandleForReading.readabilityHandler = nil
-                
-                self?.queue.async {
-                    self?.tunnelProcess = nil
-                    self?.updateStatus(.disconnected)
-                }
-            }
-            
-            do {
-                try process.run()
-                self.tunnelProcess = process
-                appLog("[TunnelManager] Cloudflare Tunnel subprocess launched.")
-            } catch {
-                let errMsg = "Failed to launch Cloudflare Tunnel: \(error.localizedDescription)"
-                appLog("[TunnelManager] \(errMsg)")
-                self.updateStatus(.error, errorMessage: error.localizedDescription)
+            self.setStatusLocked(.connecting)
+            self.beginMonitoring()
+
+            // Fallback: if the monitor never reports `.satisfied`, start anyway.
+            self.queue.asyncAfter(deadline: .now() + TunnelManager.readyTimeout) { [weak self] in
+                guard let self = self, !self.didStartInitialTunnel else { return }
+                self.didStartInitialTunnel = true
+                appLog("[TunnelManager] Network wait timed out; starting tunnel anyway.")
+                self.startTunnel(token: self.currentToken)
             }
         }
     }
-    
+
     func stopTunnel() {
         queue.sync {
+            self.userInitiatedStop = true
+            self.stableWorkItem?.cancel()
             self.stopTunnelInternal()
-            self.updateStatus(.disconnected)
+            self.setStatusLocked(.disconnected)
         }
     }
-    
-    private func stopTunnelInternal() {
-        guard let process = tunnelProcess, process.isRunning else {
-            return
+
+    /// Cancel the reachability monitor and wake observer (app teardown).
+    func stopMonitoring() {
+        queue.sync {
+            self.pathMonitor?.cancel()
+            self.pathMonitor = nil
+            if let obs = self.wakeObserver {
+                NSWorkspace.shared.notificationCenter.removeObserver(obs)
+                self.wakeObserver = nil
+            }
         }
-        
-        appLog("[TunnelManager] Stopping Cloudflare Tunnel subprocess...")
-        process.terminate()
-        process.waitUntilExit()
-        tunnelProcess = nil
-        appLog("[TunnelManager] Cloudflare Tunnel subprocess stopped.")
     }
-    
+
     var isActive: Bool {
         var active = false
         queue.sync {
             active = tunnelProcess?.isRunning ?? false
         }
         return active
+    }
+
+    // MARK: - Reachability & wake monitoring (handlers hop onto `queue`)
+
+    private func beginMonitoring() {
+        startPathMonitorIfNeeded()
+        startWakeObserverIfNeeded()
+    }
+
+    private func startPathMonitorIfNeeded() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            // start(queue:) below guarantees this runs on `queue`.
+            guard let self = self else { return }
+            let satisfied = (path.status == .satisfied)
+            let wasSatisfied = self.lastPathSatisfied
+            self.lastPathSatisfied = satisfied
+            guard satisfied else { return }
+
+            if !self.didStartInitialTunnel {
+                self.didStartInitialTunnel = true
+                appLog("[TunnelManager] Network is ready; starting tunnel.")
+                self.startTunnel(token: self.currentToken)
+            } else if !wasSatisfied && !self.currentToken.isEmpty {
+                // The network actually dropped and came back while the tunnel is
+                // active (Wi-Fi flap, sleep/wake, network switch). Rebind fresh
+                // sockets even if the pill still shows connected — cloudflared's
+                // wedged sockets don't self-heal. scheduleReconnect is single-flight.
+                appLog("[TunnelManager] Network restored after a drop; triggering reconnect.")
+                self.scheduleReconnect()
+            }
+        }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
+    }
+
+    private func startWakeObserverIfNeeded() {
+        guard wakeObserver == nil else { return }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.queue.async {
+                guard let self = self, !self.currentToken.isEmpty else { return }
+                // Sockets are often stale after sleep even if no error surfaces.
+                // Force a rebind; single-flight + backoff keep this cheap.
+                appLog("[TunnelManager] System woke from sleep; re-checking tunnel.")
+                self.scheduleReconnect()
+            }
+        }
+    }
+
+    // MARK: - Process lifecycle
+
+    /// Spawns cloudflared using `currentToken`. Must run on `queue`.
+    private func launchProcess() {
+        let token = self.currentToken
+        guard !token.isEmpty else {
+            appLog("[TunnelManager] Cloudflare Tunnel Token is empty. Skipping tunnel start.")
+            self.setStatusLocked(.disconnected)
+            return
+        }
+
+        self.userInitiatedStop = false
+        self.processGeneration += 1
+        let generation = self.processGeneration
+
+        self.setStatusLocked(.connecting)
+
+        let archName: String
+        #if arch(arm64)
+        archName = "cloudflared-silicon"
+        #else
+        archName = "cloudflared-intel"
+        #endif
+
+        let fileManager = FileManager.default
+        var binaryURL: URL?
+
+        if let url = Bundle.main.url(forResource: archName, withExtension: nil, subdirectory: "bin") {
+            binaryURL = url
+        } else if let url = Bundle.main.url(forResource: archName, withExtension: nil) {
+            binaryURL = url
+        }
+
+        if binaryURL == nil {
+            let path1 = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/bin/\(archName)")
+            if fileManager.fileExists(atPath: path1.path) {
+                binaryURL = path1
+            }
+        }
+
+        if binaryURL == nil, let exeURL = Bundle.main.executableURL {
+            let path2 = exeURL.deletingLastPathComponent().appendingPathComponent("bin/\(archName)")
+            if fileManager.fileExists(atPath: path2.path) {
+                binaryURL = path2
+            }
+        }
+
+        if binaryURL == nil {
+            let path3 = URL(fileURLWithPath: fileManager.currentDirectoryPath).appendingPathComponent("bin/\(archName)")
+            if fileManager.fileExists(atPath: path3.path) {
+                binaryURL = path3
+            }
+        }
+
+        guard let finalBinaryURL = binaryURL else {
+            // Packaging error — permanent, no point retrying.
+            let err = "[TunnelManager] Critical Error: Cloudflare binary [\(archName)] not found."
+            appLog(err)
+            self.setStatusLocked(.error, errorMessage: "cloudflared executable file not found")
+            return
+        }
+
+        appLog("[TunnelManager] Starting Cloudflare Tunnel using \(finalBinaryURL.path)...")
+
+        let process = Process()
+        process.executableURL = finalBinaryURL
+        process.arguments = ["tunnel", "run", "--token", token]
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if let output = String(data: data, encoding: .utf8), !output.isEmpty {
+                appLog("[Cloudflared STDOUT] \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+
+        // Runs on FileHandle's internal thread — only build a local summary here,
+        // then hop onto `queue` to touch shared state.
+        errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard let self = self,
+                  let output = String(data: data, encoding: .utf8), !output.isEmpty else { return }
+            let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            appLog("[Cloudflared STDERR] \(trimmedOutput)")
+
+            let lower = trimmedOutput.lowercased()
+            let sawConnected = lower.contains("established") || lower.contains("registered")
+            // A single chunk can batch many lines; count the specific fingerprint.
+            let unreachableCount = lower.components(separatedBy: "network is unreachable").count - 1
+            var genericErrorMsg: String? = nil
+            if lower.contains("failed") || lower.contains("error") || lower.contains("cannot") || lower.contains("unauthorized") {
+                if lower.contains("unauthorized") || lower.contains("token") || lower.contains("invalid") {
+                    genericErrorMsg = "Invalid or expired Token"
+                } else if lower.contains("network") || lower.contains("dns") || lower.contains("dial tcp") {
+                    genericErrorMsg = "Network / DNS connection error"
+                } else {
+                    genericErrorMsg = "Cloudflare connection error"
+                }
+            }
+
+            self.queue.async {
+                self.handleStderr(generation: generation,
+                                  sawConnected: sawConnected,
+                                  unreachableCount: unreachableCount,
+                                  genericErrorMsg: genericErrorMsg)
+            }
+        }
+
+        process.terminationHandler = { [weak self] proc in
+            appLog("[TunnelManager] Cloudflare Tunnel exited with status: \(proc.terminationStatus)")
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            errPipe.fileHandleForReading.readabilityHandler = nil
+
+            self?.queue.async {
+                guard let self = self else { return }
+                guard generation == self.processGeneration else { return }  // stale process, ignore
+                self.tunnelProcess = nil
+                if self.userInitiatedStop || self.currentToken.isEmpty {
+                    self.setStatusLocked(.disconnected)
+                } else {
+                    // Unexpected exit (crash/kill) — self-heal.
+                    self.setStatusLocked(.error, errorMessage: "Tunnel process exited — reconnecting…")
+                    self.scheduleReconnect()
+                }
+            }
+        }
+
+        do {
+            try process.run()
+            self.tunnelProcess = process
+            appLog("[TunnelManager] Cloudflare Tunnel subprocess launched.")
+        } catch {
+            appLog("[TunnelManager] Failed to launch Cloudflare Tunnel: \(error.localizedDescription)")
+            self.setStatusLocked(.error, errorMessage: error.localizedDescription)
+            self.scheduleReconnect()  // transient launch failure — retry with backoff
+        }
+    }
+
+    /// Applies a parsed stderr summary. Must run on `queue`.
+    private func handleStderr(generation: Int, sawConnected: Bool, unreachableCount: Int, genericErrorMsg: String?) {
+        guard generation == self.processGeneration else { return }  // stale process, ignore
+
+        if sawConnected {
+            self.setStatusLocked(.connected)
+            self.networkErrorEvents.removeAll()
+            self.armStableConnectionTimer()
+            return
+        }
+
+        if unreachableCount > 0 {
+            let now = Date()
+            for _ in 0..<unreachableCount { self.networkErrorEvents.append(now) }
+            let cutoff = now.addingTimeInterval(-TunnelManager.errorWindow)
+            self.networkErrorEvents.removeAll { $0 < cutoff }
+            if self.networkErrorEvents.count >= TunnelManager.errorThreshold {
+                // Sustained failure — honestly flip status (bypassing the connected latch) and relaunch.
+                self.setStatusLocked(.error, errorMessage: "Network unreachable — reconnecting…")
+                self.scheduleReconnect()
+            }
+            return
+        }
+
+        // Generic error line: keep the connected-latch so a single transient line never flaps the UI.
+        if let msg = genericErrorMsg, self.status != .connected {
+            self.setStatusLocked(.error, errorMessage: msg)
+        }
+    }
+
+    /// Relaunch cloudflared after a backoff delay. Must run on `queue`.
+    private func scheduleReconnect() {
+        guard !isReconnecting else { return }
+        isReconnecting = true
+        self.stableWorkItem?.cancel()
+
+        let delay = self.reconnectBackoff
+        self.reconnectBackoff = min(self.reconnectBackoff * 2, TunnelManager.maxBackoff)  // grow for next attempt
+        appLog("[TunnelManager] Scheduling tunnel reconnect in \(Int(delay))s...")
+
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self = self else { return }
+            self.stopTunnelInternal()          // NOT stopTunnel() — that does queue.sync and would deadlock
+            self.networkErrorEvents.removeAll()
+            self.launchProcess()
+            self.isReconnecting = false
+        }
+    }
+
+    /// After a connection holds for a while, reset the backoff. Must run on `queue`.
+    private func armStableConnectionTimer() {
+        stableWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.reconnectBackoff = TunnelManager.initialBackoff
+        }
+        stableWorkItem = work
+        queue.asyncAfter(deadline: .now() + 30, execute: work)
+    }
+
+    /// Terminate the running process with a bounded SIGTERM→SIGKILL. Must run on `queue`.
+    private func stopTunnelInternal() {
+        stableWorkItem?.cancel()
+        guard let process = tunnelProcess, process.isRunning else {
+            tunnelProcess = nil
+            return
+        }
+
+        appLog("[TunnelManager] Stopping Cloudflare Tunnel subprocess...")
+        process.terminate()  // SIGTERM
+
+        let deadline = Date().addingTimeInterval(TunnelManager.terminateGrace)
+        while process.isRunning && Date() < deadline {
+            usleep(50_000)  // 50ms
+        }
+        if process.isRunning {
+            appLog("[TunnelManager] SIGTERM timed out; sending SIGKILL.")
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+        }
+
+        tunnelProcess = nil
+        appLog("[TunnelManager] Cloudflare Tunnel subprocess stopped.")
     }
 }
 
@@ -1013,9 +1234,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let portNum = UInt16(portVal) ?? 37588
         startHttpServer(port: portNum)
         
-        // Start Tunnel Subprocess if token is set
+        // Start Tunnel Subprocess if token is set.
+        // At boot the app is launched as a Login Item, often before the network
+        // is up — so gate the first launch on real reachability to avoid
+        // cloudflared binding dead sockets.
         if let token = settings["TUNNEL_TOKEN"] as? String, !token.isEmpty {
-            tunnelManager.startTunnel(token: token)
+            tunnelManager.startTunnelWhenNetworkReady(token: token)
         }
         
         // Registers status bar item
@@ -1040,6 +1264,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     
     func applicationWillTerminate(_ aNotification: Notification) {
         httpServer?.stop()
+        tunnelManager.stopMonitoring()
         tunnelManager.stopTunnel()
     }
     
@@ -1070,6 +1295,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     
     @objc func terminateApp() {
         httpServer?.stop()
+        tunnelManager.stopMonitoring()
         tunnelManager.stopTunnel()
         
         let homeDir = FileManager.default.homeDirectoryForCurrentUser

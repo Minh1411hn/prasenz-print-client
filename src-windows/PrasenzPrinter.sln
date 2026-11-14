@@ -1,0 +1,36 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrasenzPrinter.Core", "PrasenzPrinter.Core\PrasenzPrinter.Core.csproj", "{1A1DD58F-CC34-420C-86A0-CF86E10E47F7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrasenzPrinter.Windows", "PrasenzPrinter.Windows\PrasenzPrinter.Windows.csproj", "{2B2DD58F-CC34-420C-86A0-CF86E10E47F7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrasenzPrinter.Core.Tests", "PrasenzPrinter.Core.Tests\PrasenzPrinter.Core.Tests.csproj", "{3C3DD58F-CC34-420C-86A0-CF86E10E47F7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PrasenzPrinter.Windows.Tests", "PrasenzPrinter.Windows.Tests\PrasenzPrinter.Windows.Tests.csproj", "{4D4DD58F-CC34-420C-86A0-CF86E10E47F7}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1A1DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1A1DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1A1DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1A1DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2B2DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2B2DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2B2DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2B2DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3C3DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3C3DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3C3DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3C3DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4D4DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4D4DD58F-CC34-420C-86A0-CF86E10E47F7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4D4DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4D4DD58F-CC34-420C-86A0-CF86E10E47F7}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
