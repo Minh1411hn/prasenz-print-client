@@ -64,12 +64,12 @@ SDK_PATH=$(xcrun --show-sdk-path --sdk macosx)
 
 echo -e "  ${BLUE}⚙️  Compiling for Intel (x64)...${NC}"
 swiftc -O -sdk "$SDK_PATH" -target x86_64-apple-macosx10.15 \
-  src-swift/main.swift src-swift/AppDelegate.swift src-swift/HttpServer.swift \
+  src-swift/main.swift src-swift/AppDelegate.swift src-swift/HttpServer.swift src-swift/NewRelicLogger.swift \
   -o "$DIST_DIR/PrasenzPrinter-macos-x64"
 
 echo -e "  ${BLUE}⚙️  Compiling for Apple Silicon (arm64)...${NC}"
 swiftc -O -sdk "$SDK_PATH" -target arm64-apple-macosx11.0 \
-  src-swift/main.swift src-swift/AppDelegate.swift src-swift/HttpServer.swift \
+  src-swift/main.swift src-swift/AppDelegate.swift src-swift/HttpServer.swift src-swift/NewRelicLogger.swift \
   -o "$DIST_DIR/PrasenzPrinter-macos-arm64"
 
 echo -e "  ${BLUE}⚙️  Merging 2 architectures into a Universal Binary...${NC}"
